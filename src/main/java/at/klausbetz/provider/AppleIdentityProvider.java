@@ -104,6 +104,22 @@ public class AppleIdentityProvider extends OIDCIdentityProvider implements Socia
         return context;
     }
 
+    @SuppressWarnings("rawtypes")
+    @Override
+    public void exchangeExternalComplete(UserSessionModel userSession, BrokeredIdentityContext context, MultivaluedMap params) {
+        super.exchangeExternalComplete(userSession, context, params);
+
+        if (getConfig().isStoreToken() && context.getToken() != null) {
+            RealmModel realm = session.getContext().getRealm();
+            UserModel user = userSession.getUser();
+            FederatedIdentityModel existingLink = session.users().getFederatedIdentity(realm, user, getConfig().getAlias());
+            if (existingLink != null) {
+                existingLink.setToken(context.getToken());
+                session.users().updateFederatedIdentity(realm, user, existingLink);
+            }
+        }
+    }
+
     private void autoLinkIfPossible(BrokeredIdentityContext context) {
         RealmModel realm = this.session.getContext().getRealm();
         String email = context.getEmail();

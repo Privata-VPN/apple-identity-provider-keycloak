@@ -1,7 +1,8 @@
 package at.klausbetz.provider;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.core.Context;
@@ -19,7 +20,12 @@ import org.keycloak.services.managers.AppAuthManager;
 import org.keycloak.services.managers.AuthenticationManager;
 
 import java.io.IOException;
+import java.util.List;
 
+/**
+ * Revokes the stored Apple tokens of the calling user. A realm can have several Apple IdP
+ * aliases (one per Apple developer team), so every linked identity of an Apple IdP is revoked.
+ */
 public class AppleTokenRevocationResource {
 
     private static final Logger logger = Logger.getLogger(AppleTokenRevocationResource.class);
@@ -40,80 +46,86 @@ public class AppleTokenRevocationResource {
                 .authenticate();
 
         if (authResult == null) {
-            return unauthorized("invalid_token", "Bearer token is missing or invalid");
+            return json(Response.Status.UNAUTHORIZED, body("error", "invalid_token", "Bearer token is missing or invalid"));
         }
 
-        UserModel user = authResult.getUser();
+        UserModel user = authResult.user();
         RealmModel realm = session.getContext().getRealm();
 
-        IdentityProviderModel appleIdp = session.identityProviders().getByAlias("apple");
-        if (appleIdp == null) {
-            return error(Response.Status.NOT_FOUND, "apple_idp_not_configured",
-                    "No Apple identity provider configured in this realm");
-        }
+        List<FederatedIdentityModel> appleLinks = session.users().getFederatedIdentitiesStream(realm, user)
+                .filter(link -> appleIdp(link.getIdentityProvider()) != null)
+                .toList();
 
-        FederatedIdentityModel federatedIdentity = session.users()
-                .getFederatedIdentity(realm, user, "apple");
-        if (federatedIdentity == null || federatedIdentity.getToken() == null) {
-            return ok("no_token", "No Apple token stored for this user");
-        }
-
-        try {
-            JsonNode tokenJson = mapper.readTree(federatedIdentity.getToken());
-            String refreshToken = textOrNull(tokenJson, "refresh_token");
-            String accessToken = textOrNull(tokenJson, "access_token");
-            String token = refreshToken != null ? refreshToken : accessToken;
-            if (token == null) {
-                return ok("no_token", "Stored token contains no revocable tokens");
+        ArrayNode providers = mapper.createArrayNode();
+        int revoked = 0;
+        int failed = 0;
+        for (FederatedIdentityModel link : appleLinks) {
+            String status = revoke(user, link, appleIdp(link.getIdentityProvider()));
+            providers.addObject().put("alias", link.getIdentityProvider()).put("status", status);
+            if ("revoked".equals(status)) {
+                revoked++;
+            } else if ("failed".equals(status)) {
+                failed++;
             }
-            String tokenTypeHint = refreshToken != null ? "refresh_token" : "access_token";
+        }
 
-            AppleIdentityProviderConfig config = new AppleIdentityProviderConfig(appleIdp);
+        if (failed > 0) {
+            ObjectNode body = body("error", "apple_error", "Apple token revocation failed for " + failed + " provider(s)");
+            body.set("providers", providers);
+            return json(Response.Status.BAD_GATEWAY, body);
+        }
+        ObjectNode body = revoked > 0
+                ? body("status", "revoked", "Apple token revoked successfully")
+                : body("status", "no_token", "No Apple token stored for this user");
+        body.set("providers", providers);
+        return json(Response.Status.OK, body);
+    }
+
+    private IdentityProviderModel appleIdp(String alias) {
+        IdentityProviderModel idp = session.identityProviders().getByAlias(alias);
+        return idp != null && AppleIdentityProviderFactory.PROVIDER_ID.equals(idp.getProviderId()) ? idp : null;
+    }
+
+    private String revoke(UserModel user, FederatedIdentityModel link, IdentityProviderModel idp) {
+        String alias = link.getIdentityProvider();
+        if (link.getToken() == null) {
+            return "no_token";
+        }
+        try {
+            AppleIdentityProviderConfig config = new AppleIdentityProviderConfig(idp);
+            AppleStoredToken stored = AppleStoredToken.parse(link.getToken(), config.getClientId());
+            if (stored == null) {
+                return "no_token";
+            }
+
             AppleIdentityProvider provider = new AppleIdentityProvider(session, config);
-            provider.prepareClientSecret(config.getClientId());
+            provider.prepareClientSecret(stored.getClientId());
 
             SimpleHttp.Response response = SimpleHttp.doPost(APPLE_REVOKE_URL, session)
-                    .param("client_id", config.getClientId())
+                    .param("client_id", stored.getClientId())
                     .param("client_secret", config.getClientSecret())
-                    .param("token", token)
-                    .param("token_type_hint", tokenTypeHint)
+                    .param("token", stored.getToken())
+                    .param("token_type_hint", stored.getTokenTypeHint())
                     .asResponse();
 
             if (response.getStatus() == 200) {
-                logger.infof("Apple token revoked for user %s", user.getId());
-                return ok("revoked", "Apple token revoked successfully");
-            } else {
-                String body = response.asString();
-                logger.warnf("Apple revocation returned %d for user %s: %s",
-                        response.getStatus(), user.getId(), body);
-                return error(Response.Status.fromStatusCode(response.getStatus()),
-                        "apple_error", "Apple returned status " + response.getStatus());
+                logger.infof("Apple token revoked for user %s alias %s client %s", user.getId(), alias, stored.getClientId());
+                return "revoked";
             }
+            logger.warnf("Apple revocation returned %d for user %s alias %s client %s: %s",
+                    response.getStatus(), user.getId(), alias, stored.getClientId(), response.asString());
+            return "failed";
         } catch (IOException e) {
-            logger.error("Failed to revoke Apple token for user " + user.getId(), e);
-            return error(Response.Status.INTERNAL_SERVER_ERROR, "revocation_failed", e.getMessage());
+            logger.errorf(e, "Failed to revoke Apple token for user %s alias %s", user.getId(), alias);
+            return "failed";
         }
     }
 
-    private static String textOrNull(JsonNode node, String field) {
-        JsonNode child = node.get(field);
-        return (child != null && !child.isNull()) ? child.asText() : null;
+    private static ObjectNode body(String key, String value, String message) {
+        return mapper.createObjectNode().put(key, value).put("message", message);
     }
 
-    private static Response ok(String status, String message) {
-        return Response.ok("{\"status\":\"" + status + "\",\"message\":\"" + message + "\"}")
-                .type(MediaType.APPLICATION_JSON_TYPE).build();
-    }
-
-    private static Response unauthorized(String error, String message) {
-        return Response.status(Response.Status.UNAUTHORIZED)
-                .entity("{\"error\":\"" + error + "\",\"message\":\"" + message + "\"}")
-                .type(MediaType.APPLICATION_JSON_TYPE).build();
-    }
-
-    private static Response error(Response.Status status, String error, String message) {
-        return Response.status(status)
-                .entity("{\"error\":\"" + error + "\",\"message\":\"" + message + "\"}")
-                .type(MediaType.APPLICATION_JSON_TYPE).build();
+    private static Response json(Response.Status status, ObjectNode body) {
+        return Response.status(status).entity(body.toString()).type(MediaType.APPLICATION_JSON_TYPE).build();
     }
 }
